@@ -1,0 +1,1 @@
+{"name":"hasan-legal-radar-runner","version":"0.1.0","private":true,"type":"module","scripts":{"start":"node server.js","test":"node --check server.js"},"engines":{"node":">=20"},"dependencies":{"express":"^4.18.3","cors":"^2.8.5"}}
