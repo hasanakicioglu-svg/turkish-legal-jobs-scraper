@@ -10,6 +10,8 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://hasan-legal-rada
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 60000);
+
 const queryPlan = [
   { id: 'tr-linkedin-legal', geography: 'Türkiye', source: 'LinkedIn / indexed web', query: 'site:linkedin.com/jobs Turkey legal counsel OR legal manager OR hukuk müdürü OR hukuk müşaviri' },
   { id: 'tr-kariyer-legal', geography: 'Türkiye', source: 'Kariyer.net / indexed web', query: 'site:kariyer.net/is-ilani hukuk müdürü OR hukuk müşaviri OR legal counsel OR legal manager' },
@@ -51,6 +53,13 @@ function setProgress(run, patch) {
   runs.set(run.runId, run);
 }
 
+function normalizeError(error) {
+  if (error?.name === 'TimeoutError' || /aborted due to timeout/i.test(error?.message || '')) {
+    return `Search timeout after ${Math.round(SEARCH_TIMEOUT_MS / 1000)}s`;
+  }
+  return error?.message || 'Unknown search error';
+}
+
 async function searchWithSerpApi(task) {
   const apiKey = process.env.SERPAPI_KEY;
   if (!apiKey) {
@@ -67,7 +76,7 @@ async function searchWithSerpApi(task) {
   url.searchParams.set('num', '10');
   url.searchParams.set('api_key', apiKey);
 
-  const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
+  const response = await fetch(url, { signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS) });
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(`SerpAPI HTTP ${response.status}${body ? `: ${body.slice(0, 240)}` : ''}`);
@@ -94,7 +103,7 @@ function candidateLooksRelevant(item) {
   return /(legal|hukuk|avukat|müşavir|counsel|lawyer|contract|contracts|governance|compliance|ai counsel|legal engineer)/i.test(text);
 }
 
-function summarizeBlockers(blockers) {
+function summarizeBlockers(blockers, findings) {
   if (!blockers.length) {
     return 'Manual scan runner completed discovery. Candidates still require verification before dashboard admission.';
   }
@@ -103,6 +112,13 @@ function summarizeBlockers(blockers) {
   const missingSerpApi = reasons.some((reason) => /SERPAPI_KEY is not configured/i.test(reason));
   if (missingSerpApi) {
     return 'Manual scan runner is connected, but SERPAPI_KEY is not visible to the running Render service.';
+  }
+
+  const timeoutCount = reasons.filter((reason) => /timeout/i.test(reason)).length;
+  if (timeoutCount) {
+    return findings.length
+      ? `Manual scan partially completed. ${timeoutCount} query group timed out; ${findings.length} candidate(s) were still captured for later verification.`
+      : `Manual scan reached SerpAPI, but the search provider timed out after ${Math.round(SEARCH_TIMEOUT_MS / 1000)}s. Try again once; if it repeats, reduce query size or increase service timeout.`;
   }
 
   const providerErrors = reasons.filter((reason) => /SerpAPI/i.test(reason));
@@ -117,7 +133,7 @@ async function executeRun(runId) {
   const run = runs.get(runId);
   if (!run) return;
 
-  console.log(JSON.stringify({ event: 'manual_scan_started', runId, searchConfigured: Boolean(process.env.SERPAPI_KEY), taskCount: queryPlan.length }));
+  console.log(JSON.stringify({ event: 'manual_scan_started', runId, searchConfigured: Boolean(process.env.SERPAPI_KEY), searchTimeoutMs: SEARCH_TIMEOUT_MS, taskCount: queryPlan.length }));
   setProgress(run, {
     status: 'running',
     outcome: 'partial',
@@ -156,12 +172,13 @@ async function executeRun(runId) {
         relevantCandidateCount: relevant.length
       });
     } catch (error) {
-      const failure = { taskId: task.id, reason: error.message };
+      const reason = normalizeError(error);
+      const failure = { taskId: task.id, reason };
       blockers.push(failure);
       auditTasks.push({
         ...task,
-        status: 'failed',
-        reason: error.message,
+        status: /timeout/i.test(reason) ? 'timeout' : 'failed',
+        reason,
         startedAt: taskStarted,
         finishedAt: new Date().toISOString(),
         resultCount: 0,
@@ -170,10 +187,11 @@ async function executeRun(runId) {
     }
   }
 
-  const note = summarizeBlockers(blockers);
-  console.log(JSON.stringify({ event: 'manual_scan_finished', runId, status: blockers.length ? 'blocked' : 'completed', blockerCount: blockers.length, findingCount: findings.length, note }));
+  const status = blockers.length ? (findings.length ? 'partial_completed' : 'blocked') : 'completed';
+  const note = summarizeBlockers(blockers, findings);
+  console.log(JSON.stringify({ event: 'manual_scan_finished', runId, status, blockerCount: blockers.length, findingCount: findings.length, note }));
   setProgress(run, {
-    status: blockers.length ? 'blocked' : 'completed',
+    status,
     outcome: blockers.length ? 'partial' : 'complete',
     finishedAt: new Date().toISOString(),
     note,
@@ -185,13 +203,14 @@ async function executeRun(runId) {
       tasks: auditTasks,
       generatedAt: new Date().toISOString(),
       searchConfiguredAtRuntime: Boolean(process.env.SERPAPI_KEY),
+      searchTimeoutMs: SEARCH_TIMEOUT_MS,
       admissionPolicy: 'Discovery results are candidates only. Date, active link, duplicate and mandatory third-language filters still require verification before registry update.'
     }
   });
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'hasan-legal-radar-runner', startedAt, searchConfigured: Boolean(process.env.SERPAPI_KEY) });
+  res.json({ ok: true, service: 'hasan-legal-radar-runner', startedAt, searchConfigured: Boolean(process.env.SERPAPI_KEY), searchTimeoutMs: SEARCH_TIMEOUT_MS });
 });
 
 app.post('/runs', (req, res) => {
