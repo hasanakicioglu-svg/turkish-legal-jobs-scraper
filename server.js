@@ -68,8 +68,14 @@ async function searchWithSerpApi(task) {
   url.searchParams.set('api_key', apiKey);
 
   const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
-  if (!response.ok) throw new Error(`SerpAPI HTTP ${response.status}`);
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`SerpAPI HTTP ${response.status}${body ? `: ${body.slice(0, 240)}` : ''}`);
+  }
+
   const data = await response.json();
+  if (data.error) throw new Error(`SerpAPI error: ${data.error}`);
+
   const organic = Array.isArray(data.organic_results) ? data.organic_results : [];
   return {
     status: 'searched',
@@ -88,10 +94,30 @@ function candidateLooksRelevant(item) {
   return /(legal|hukuk|avukat|müşavir|counsel|lawyer|contract|contracts|governance|compliance|ai counsel|legal engineer)/i.test(text);
 }
 
+function summarizeBlockers(blockers) {
+  if (!blockers.length) {
+    return 'Manual scan runner completed discovery. Candidates still require verification before dashboard admission.';
+  }
+
+  const reasons = [...new Set(blockers.map((blocker) => blocker.reason).filter(Boolean))];
+  const missingSerpApi = reasons.some((reason) => /SERPAPI_KEY is not configured/i.test(reason));
+  if (missingSerpApi) {
+    return 'Manual scan runner is connected, but SERPAPI_KEY is not visible to the running Render service.';
+  }
+
+  const providerErrors = reasons.filter((reason) => /SerpAPI/i.test(reason));
+  if (providerErrors.length) {
+    return `Manual scan runner reached Render, but SerpAPI returned an error: ${providerErrors[0]}`;
+  }
+
+  return `Manual scan runner finished with blockers: ${reasons[0] || 'unknown blocker'}`;
+}
+
 async function executeRun(runId) {
   const run = runs.get(runId);
   if (!run) return;
 
+  console.log(JSON.stringify({ event: 'manual_scan_started', runId, searchConfigured: Boolean(process.env.SERPAPI_KEY), taskCount: queryPlan.length }));
   setProgress(run, {
     status: 'running',
     outcome: 'partial',
@@ -144,13 +170,13 @@ async function executeRun(runId) {
     }
   }
 
+  const note = summarizeBlockers(blockers);
+  console.log(JSON.stringify({ event: 'manual_scan_finished', runId, status: blockers.length ? 'blocked' : 'completed', blockerCount: blockers.length, findingCount: findings.length, note }));
   setProgress(run, {
     status: blockers.length ? 'blocked' : 'completed',
     outcome: blockers.length ? 'partial' : 'complete',
     finishedAt: new Date().toISOString(),
-    note: blockers.length
-      ? 'Manual scan runner is connected, but search credentials/configuration are incomplete.'
-      : 'Manual scan runner completed discovery. Candidates still require verification before dashboard admission.',
+    note,
     progress: { total: queryPlan.length, completed: queryPlan.length, current: null },
     blockers,
     findings,
@@ -158,6 +184,7 @@ async function executeRun(runId) {
       queryCount: queryPlan.length,
       tasks: auditTasks,
       generatedAt: new Date().toISOString(),
+      searchConfiguredAtRuntime: Boolean(process.env.SERPAPI_KEY),
       admissionPolicy: 'Discovery results are candidates only. Date, active link, duplicate and mandatory third-language filters still require verification before registry update.'
     }
   });
