@@ -10,6 +10,15 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://hasan-legal-rada
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const queryPlan = [
+  { id: 'tr-linkedin-legal', geography: 'Türkiye', source: 'LinkedIn / indexed web', query: 'site:linkedin.com/jobs Turkey legal counsel OR legal manager OR hukuk müdürü OR hukuk müşaviri' },
+  { id: 'tr-kariyer-legal', geography: 'Türkiye', source: 'Kariyer.net / indexed web', query: 'site:kariyer.net/is-ilani hukuk müdürü OR hukuk müşaviri OR legal counsel OR legal manager' },
+  { id: 'tr-contracts', geography: 'Türkiye', source: 'indexed web', query: 'Turkey "Manager - Contract" OR "Contracts Manager" OR "Commercial & Contracts Manager" legal regulatory compliance' },
+  { id: 'gcc-legal-leadership', geography: 'GCC', source: 'LinkedIn / indexed web', query: 'Saudi UAE Qatar Kuwait Oman Bahrain legal director OR general counsel OR head of legal' },
+  { id: 'gcc-contracts', geography: 'GCC', source: 'LinkedIn / indexed web', query: 'Dubai Riyadh Doha "Manager - Contract" OR "Contracts Manager" dispute resolution contractual risk' },
+  { id: 'global-legal-ai', geography: 'Global / Remote', source: 'indexed web', query: 'legal engineer OR AI counsel OR legal AI product counsel OR legal knowledge engineer remote' }
+];
+
 app.use(express.json({ limit: '64kb' }));
 app.use(cors({
   origin(origin, callback) {
@@ -18,8 +27,144 @@ app.use(cors({
   }
 }));
 
+function publicRun(run) {
+  return {
+    runId: run.runId,
+    status: run.status,
+    outcome: run.outcome,
+    scope: run.scope,
+    source: run.source,
+    requestedAt: run.requestedAt,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    progress: run.progress,
+    note: run.note,
+    blockers: run.blockers,
+    findings: run.findings,
+    audit: run.audit
+  };
+}
+
+function setProgress(run, patch) {
+  Object.assign(run, patch);
+  run.updatedAt = new Date().toISOString();
+  runs.set(run.runId, run);
+}
+
+async function searchWithSerpApi(task) {
+  const apiKey = process.env.SERPAPI_KEY;
+  if (!apiKey) {
+    return {
+      status: 'blocked',
+      reason: 'SERPAPI_KEY is not configured on Render. No external search was executed.',
+      items: []
+    };
+  }
+
+  const url = new URL('https://serpapi.com/search.json');
+  url.searchParams.set('engine', 'google');
+  url.searchParams.set('q', task.query);
+  url.searchParams.set('num', '10');
+  url.searchParams.set('api_key', apiKey);
+
+  const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
+  if (!response.ok) throw new Error(`SerpAPI HTTP ${response.status}`);
+  const data = await response.json();
+  const organic = Array.isArray(data.organic_results) ? data.organic_results : [];
+  return {
+    status: 'searched',
+    reason: null,
+    items: organic.slice(0, 10).map((item) => ({
+      title: item.title || '',
+      link: item.link || '',
+      snippet: item.snippet || '',
+      source: item.source || task.source
+    }))
+  };
+}
+
+function candidateLooksRelevant(item) {
+  const text = `${item.title} ${item.snippet}`.toLowerCase();
+  return /(legal|hukuk|avukat|müşavir|counsel|lawyer|contract|contracts|governance|compliance|ai counsel|legal engineer)/i.test(text);
+}
+
+async function executeRun(runId) {
+  const run = runs.get(runId);
+  if (!run) return;
+
+  setProgress(run, {
+    status: 'running',
+    outcome: 'partial',
+    startedAt: new Date().toISOString(),
+    note: 'Manual scan workflow started on Render.',
+    progress: { total: queryPlan.length, completed: 0, current: queryPlan[0]?.id || null }
+  });
+
+  const findings = [];
+  const auditTasks = [];
+  const blockers = [];
+
+  for (const task of queryPlan) {
+    const taskStarted = new Date().toISOString();
+    try {
+      setProgress(run, { progress: { total: queryPlan.length, completed: auditTasks.length, current: task.id } });
+      const result = await searchWithSerpApi(task);
+      const relevant = result.items.filter(candidateLooksRelevant);
+      findings.push(...relevant.map((item) => ({
+        taskId: task.id,
+        geography: task.geography,
+        source: task.source,
+        title: item.title,
+        link: item.link,
+        snippet: item.snippet,
+        status: 'candidate_unreviewed'
+      })));
+      if (result.status === 'blocked') blockers.push({ taskId: task.id, reason: result.reason });
+      auditTasks.push({
+        ...task,
+        status: result.status,
+        reason: result.reason,
+        startedAt: taskStarted,
+        finishedAt: new Date().toISOString(),
+        resultCount: result.items.length,
+        relevantCandidateCount: relevant.length
+      });
+    } catch (error) {
+      const failure = { taskId: task.id, reason: error.message };
+      blockers.push(failure);
+      auditTasks.push({
+        ...task,
+        status: 'failed',
+        reason: error.message,
+        startedAt: taskStarted,
+        finishedAt: new Date().toISOString(),
+        resultCount: 0,
+        relevantCandidateCount: 0
+      });
+    }
+  }
+
+  setProgress(run, {
+    status: blockers.length ? 'blocked' : 'completed',
+    outcome: blockers.length ? 'partial' : 'complete',
+    finishedAt: new Date().toISOString(),
+    note: blockers.length
+      ? 'Manual scan runner is connected, but search credentials/configuration are incomplete.'
+      : 'Manual scan runner completed discovery. Candidates still require verification before dashboard admission.',
+    progress: { total: queryPlan.length, completed: queryPlan.length, current: null },
+    blockers,
+    findings,
+    audit: {
+      queryCount: queryPlan.length,
+      tasks: auditTasks,
+      generatedAt: new Date().toISOString(),
+      admissionPolicy: 'Discovery results are candidates only. Date, active link, duplicate and mandatory third-language filters still require verification before registry update.'
+    }
+  });
+}
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'hasan-legal-radar-runner', startedAt });
+  res.json({ ok: true, service: 'hasan-legal-radar-runner', startedAt, searchConfigured: Boolean(process.env.SERPAPI_KEY) });
 });
 
 app.post('/runs', (req, res) => {
@@ -27,19 +172,36 @@ app.post('/runs', (req, res) => {
   const run = {
     runId,
     status: 'accepted',
+    outcome: 'partial',
     scope: req.body?.scope || 'full',
     source: req.body?.source || 'manual',
     requestedAt: new Date().toISOString(),
-    note: 'Test endpoint only. Full scan engine is not attached yet.'
+    startedAt: null,
+    finishedAt: null,
+    progress: { total: queryPlan.length, completed: 0, current: null },
+    blockers: [],
+    findings: [],
+    audit: null,
+    note: 'Manual scan request accepted. Discovery will start asynchronously.'
   };
   runs.set(runId, run);
-  res.status(202).json(run);
+  setTimeout(() => executeRun(runId).catch((error) => {
+    const failed = runs.get(runId);
+    if (failed) setProgress(failed, { status: 'failed', outcome: 'partial', finishedAt: new Date().toISOString(), note: error.message });
+  }), 0);
+  res.status(202).json(publicRun(run));
 });
 
 app.get('/runs/:runId', (req, res) => {
   const run = runs.get(req.params.runId);
   if (!run) return res.status(404).json({ error: 'run_not_found' });
-  return res.json(run);
+  return res.json(publicRun(run));
+});
+
+app.get('/runs/:runId/results', (req, res) => {
+  const run = runs.get(req.params.runId);
+  if (!run) return res.status(404).json({ error: 'run_not_found' });
+  return res.json({ runId: run.runId, status: run.status, findings: run.findings, audit: run.audit });
 });
 
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
