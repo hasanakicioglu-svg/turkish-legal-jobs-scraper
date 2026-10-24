@@ -1,0 +1,1 @@
+{"name":"temporary-income-multisource-radar","version":"1.0.0","private":true,"type":"module","engines":{"node":">=20"},"scripts":{"start":"node app.js","test":"node --test"}}
