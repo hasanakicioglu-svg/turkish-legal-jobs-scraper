@@ -1,10 +1,11 @@
 import http from 'node:http';
 import { URL } from 'node:url';
+import { readFileSync } from 'node:fs';
 
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.RADAR_RUN_TOKEN || '';
-const BRAVE = process.env.BRAVE_SEARCH_API_KEY || '';
-const HOURS = 6 * 60 * 60 * 1000;
+// No commercial search API is required. Each source is checked separately.
+const HOURS = 2 * 60 * 60 * 1000;
 const sources = [
  ['Mercor','mercor.com'], ['micro1','micro1.ai'], ['Turing','turing.com'],
  ['AfterQuery','afterquery.com'], ['DataAnnotation','dataannotation.tech'],
@@ -42,12 +43,12 @@ function assess(j){
  let eligibility='needs-verification';
  if(Array.isArray(j.restrictions)){
   const r=j.restrictions.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ');
-  eligibility=j.restrictions.length===0||turkey.test(r)||anywhere.test(r)?'eligible':'excluded';
+  eligibility=j.restrictions.length===0?'needs-verification':(turkey.test(r)||anywhere.test(r)?'eligible':'excluded');
  }else if(turkey.test(j.location)||anywhere.test(j.location))eligibility='eligible';
  else if(regionOnly.test(j.location))eligibility='excluded';
  if(eligibility==='excluded')return null;
  if(j.source==='Prolific')eligibility='needs-verification';
- if(j.type==='indexed')eligibility='needs-verification';
+ if(j.type==='manual')eligibility='needs-verification';
  let titleMatch=groups.some(([,re])=>re.test(j.title));
  const score=Math.min(100,(titleMatch?60:35)+8*tags.length+(eligibility==='eligible'?15:0));
  return {...j,eligibility,tags,score};
@@ -68,51 +69,115 @@ async function remoteok(){const d=await getJson('https://remoteok.com/api');if(!
 async function jobicy(){let d;try{d=await getJson('https://jobicy.com/api/jobs?count=200');}catch(e){d=await getJson('https://jobicy.com/api/v2/remote-jobs?count=200');}
  return {jobs:(d.jobs||[]).map(x=>job({source:'Jobicy',id:x.id,title:x.jobTitle||x.title,company:x.companyName,url:x.url||x.jobUrl,description:x.jobDescription||x.description,location:x.jobGeo||x.location,published:x.pubDate}))};}
 async function arbeitnow(){const d=await getJson('https://www.arbeitnow.com/api/job-board-api');return {jobs:(d.data||[]).filter(x=>x.remote===true).map(x=>job({source:'Arbeitnow',id:x.slug||x.url,title:x.title,company:x.company_name,url:x.url,description:x.description,location:x.location,published:x.created_at}))};}
-async function indexed(target){if(!BRAVE)return {name:target.name,status:'not-configured',reason:'Search API key required: BRAVE_SEARCH_API_KEY',found:0,items:[]};
- return api(target.name,async()=>{const items=[],errors=[];const queries=[`site:${target.domain} (remote OR freelance) (Turkish OR document OR legal OR evaluator OR research) job`,`site:${target.domain} (remote OR contract) (data OR annotation OR reviewer OR analysis OR language) apply`];
-  for(const q of queries)try{const d=await getJson('https://api.search.brave.com/res/v1/web/search?'+new URLSearchParams({q,count:'20'}),{'X-Subscription-Token':BRAVE});
-   for(const x of d.web?.results||[]){const u=link(x.url);if(!u)continue;const host=new URL(u).hostname.toLowerCase();const domain=target.domain.split('/')[0];if(!(host===domain||host.endsWith('.'+domain)))continue;
-   items.push(job({source:target.name,type:'indexed',url:u,title:x.title,company:target.name,description:x.description,state:'unverified-indexed-lead'}));}
-  }catch(e){errors.push(e.message)}
-  return {jobs:items,errors};
- }).then(x=>({...x,status:x.status==='ok'?'partial':x.status,reason:x.status==='ok'?'Indexed search: original job status and Türkiye eligibility must be verified':x.reason}));}
-async function pool(list,fn,parallel=4){let i=0;const out=new Array(list.length);await Promise.all(Array.from({length:Math.min(parallel,list.length)},async()=>{while(i<list.length){const k=i++;out[k]=await fn(list[k]);}}));return out;}
-async function scan(){
- const primary=await Promise.all([api('Remotive',remotive),api('Himalayas',himalayas),api('Remote OK',remoteok),api('Jobicy',jobicy),api('Arbeitnow',arbeitnow)]);
- const indexedResults=await pool(sources,indexed,4);
- const result=[...primary,...indexedResults];
- const byUrl=new Map();
- for(const src of result)for(const raw of src.items||[]){const j=assess(raw);if(!j)continue;const key=j.url.toLowerCase();if(!byUrl.has(key)||byUrl.get(key).score<j.score)byUrl.set(key,j);}
- const jobs=[...byUrl.values()].sort((a,b)=>b.score-a.score);
- return {scannedAt:new Date().toISOString(),summary:{sources:result.length,ok:result.filter(x=>x.status==='ok').length,partial:result.filter(x=>x.status==='partial').length,unconfigured:result.filter(x=>x.status==='not-configured').length,errors:result.filter(x=>x.status==='error').length,reviewableJobs:jobs.length},sources:result.map(({items,...rest})=>rest),jobs};
-}
-function send(res,data,status=200){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data));}
-function auth(req){return TOKEN && req.headers.authorization===`Bearer ${TOKEN}`;}
-const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Temporary Income Radar</title><style>
-:root{color-scheme:light;font-family:system-ui,-apple-system,Arial,sans-serif;color:#1c2e45;background:#f5f7fc}*{box-sizing:border-box}body{max-width:1250px;margin:auto;padding:24px}h1{margin:0;font-size:28px}header{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}p{line-height:1.5}header p,.muted{color:#617187}.row{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0}.pill,input,select,button{background:white;color:#23354d;border:1px solid #d4dde9;padding:10px 12px;border-radius:9px}button{cursor:pointer}button.primary{background:#185ad5;border-color:#185ad5;color:white}input[type=search]{flex:1;min-width:250px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}.card{background:white;border:1px solid #dfe7f1;border-radius:13px;padding:17px}.card h3{font-size:18px;margin:8px 0}.card a{color:#1156bc}.small{font-size:12px}.badge{display:inline-block;padding:3px 8px;border-radius:6px;background:#e8edf5;font-size:12px;margin:3px}.good{background:#dff5e8;color:#115730}.warn{background:#fff0cb;color:#845400}.bad{color:#ad2828}details{margin-top:24px}table{width:100%;border-collapse:collapse;background:white}td,th{border:1px solid #dfe7f1;padding:8px;text-align:left;font-size:13px}button:disabled{opacity:.5}#msg{color:#324968}small{font-size:12px}@media(max-width:640px){body{padding:14px}h1{font-size:22px}}
-</style></head><body><header><div><h1>Temporary Income Radar</h1><p>Remote work from Türkiye · any seniority · legal and non-legal · no auto-applications</p></div><button id="scan" class="primary">Run source scans</button></header>
-<div class="row" id="summary"><span class="pill">No scan yet</span></div><div class="row"><input type="search" id="query" placeholder="Find a skill, company or role"><select id="elig"><option value="">All potential matches</option><option value="eligible">Türkiye eligible (source indication)</option><option value="needs-verification">Eligibility needs verification</option></select><label class="pill"><input type="checkbox" id="completed"> Show completed</label></div><p id="msg"></p><main class="grid" id="list"></main><details><summary><strong>Independent source audit</strong> — click to see successes, failures and missing integrations</summary><table><thead><tr><th>Source</th><th>Status</th><th>Found</th><th>Reason</th></tr></thead><tbody id="audit"></tbody></table></details><p class="muted"><small>Sources include Remotive, Himalayas, Remote OK, Jobicy, Arbeitnow and indexed searches of 22 specialist platforms (when configured). Indexed entries are unverified leads, not guaranteed vacancies. "Applied" and "Don't show" choices stay in this browser. No CV is sent to external job websites.</small></p>
-<script>
-const el=id=>document.getElementById(id);let all=[];let cache=null;const states=()=>{try{return JSON.parse(localStorage.getItem('tir-v1-status')||'{}')}catch{return {}}};function state(id){return states()[id]||'new'};const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function load(){try{const d=await(await fetch('/v1/jobs')).json();cache=d;all=d.jobs||[];el('summary').innerHTML=d.summary?'<span class="pill">Last scan: '+esc(d.scannedAt)+'</span><span class="pill">Matches: '+d.summary.reviewableJobs+'</span><span class="pill">Sources: '+d.summary.sources+'</span><span class="pill">Not configured: '+d.summary.unconfigured+'</span><span class="pill">Errors: '+d.summary.errors+'</span>':'<span class="pill">No scan yet — press Run source scans</span>';const s=await(await fetch('/v1/sources')).json();el('audit').innerHTML=(s.sources||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.status)+'</td><td>'+esc(x.found||0)+'</td><td>'+esc(x.reason||(x.errors||[]).join(' ; '))+'</td></tr>').join('');show()}catch(e){el('msg').textContent=e.message}}
-function show(){const q=el('query').value.toLowerCase(),e=el('elig').value,done=el('completed').checked,st=states();const filtered=all.filter(j=>(done||!['applied','dismissed'].includes(st[j.url]))&&(!e||j.eligibility===e)&&(!q||(j.title+' '+j.company+' '+j.description+' '+j.tags.join(' ')).toLowerCase().includes(q)));el('list').innerHTML=filtered.length?filtered.map((j,i)=>'<article class="card" data-url="'+esc(j.url)+'"><div class="muted small">'+esc(j.source)+' · '+esc(j.company)+' '+(j.published?'· '+esc(j.published.slice(0,10)):'')+'</div><h3><a href="'+esc(j.url)+'" rel="noopener noreferrer" target="_blank">'+esc(j.title)+'</a></h3><span class="badge '+(j.eligibility==='eligible'?'good':'warn')+'">'+(j.eligibility==='eligible'?'Türkiye source match':'Check Türkiye eligibility')+'</span><span class="badge">'+esc(j.state)+'</span><p>'+esc(j.description.slice(0,320))+'</p><div>'+j.tags.map(t=>'<span class="badge">'+esc(t)+'</span>').join('')+'</div><div class="row"><button data-act="seen">Seen</button><button data-act="applied">Applied</button><button data-act="dismissed">Don\'t show</button></div></article>').join(''):'<p>No jobs match these filters. Check the independent source audit.</p>';}
-el('list').addEventListener('click',event=>{const b=event.target.closest('button[data-act]');if(!b)return;const card=b.closest('article[data-url]');if(!card)return;const s=states();s[card.dataset.url]=b.dataset.act;localStorage.setItem('tir-v1-status',JSON.stringify(s));show()});el('query').oninput=show;el('elig').onchange=show;el('completed').onchange=show;
-el('scan').onclick=async()=>{let token=sessionStorage.getItem('tir-v1-token')||prompt('Enter your Temporary Income Radar run token:')||'';if(!token)return;el('scan').disabled=true;el('msg').textContent='Scanning independent sources…';try{const r=await fetch('/v1/scan',{method:'POST',headers:{Authorization:'Bearer '+token}});if(!r.ok){if(r.status===401)sessionStorage.removeItem('tir-v1-token');throw new Error('Scan failed (HTTP '+r.status+')')}sessionStorage.setItem('tir-v1-token',token);await load();el('msg').textContent='Scan complete. See source audit for coverage and missing integrations.'}catch(e){el('msg').textContent=e.message}finally{el('scan').disabled=false}};
-load();
-</script></body></html>`;
-
-http.createServer(async(req,res)=>{try{
- const u=new URL(req.url,'http://localhost');
- if(req.method==='GET'&&(u.pathname==='/'||u.pathname==='/dashboard')){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"});res.end(html);return;}
- if(req.method==='GET'&&u.pathname==='/health')return send(res,{ok:true,scannedAt:snapshot?.scannedAt||null,sourceCount:sources.length+5,indexedConfigured:!!BRAVE});
- if(req.method==='GET'&&u.pathname==='/v1/jobs')return send(res,{scannedAt:snapshot?.scannedAt||null,summary:snapshot?.summary||null,jobs:snapshot?.jobs||[]});
- if(req.method==='GET'&&u.pathname==='/v1/sources')return send(res,{sources:snapshot?.sources||sources.map(x=>({name:x.name,status:BRAVE?'not-scanned':'not-configured',reason:BRAVE?'Awaiting scan':'Search provider key required'})),searchConfigured:!!BRAVE});
- if(req.method==='POST'&&u.pathname==='/v1/scan'){
-  if(!auth(req))return send(res,{error:'Unauthorized'},401);
-  if(snapshot&&Date.now()-Date.parse(snapshot.scannedAt)<HOURS)return send(res,{...snapshot,cached:true});
-  if(!currentRun)currentRun=scan().then(x=>(snapshot=x,x)).finally(()=>{currentRun=null});
-  return send(res,await currentRun);
+const extraSites = [
+ ['Indeed','indeed.com'],['Glassdoor','glassdoor.com'],['We Work Remotely','weworkremotely.com'],
+ ['FlexJobs','flexjobs.com'],['Upwork','upwork.com'],['Contra','contra.com'],
+ ['Freelancer','freelancer.com'],['PeoplePerHour','peopleperhour.com'],
+ ['UserTesting','usertesting.com'],['Respondent','respondent.io'],['User Interviews','userinterviews.com']
+];
+const apiConnectors={Remotive:remotive,Himalayas:himalayas,'Remote OK':remoteok,Jobicy:jobicy,Arbeitnow:arbeitnow};
+const catalogue=[];
+const searchGroups=[
+ {id:'ai-experts',title:'AI expert and project platforms',members:['Mercor','micro1','Turing','AfterQuery']},
+ {id:'ai-evaluation',title:'AI evaluation and data labeling',members:['DataAnnotation','Mindrift','Outlier AI','Alignerr','Welo Data']},
+ {id:'language',title:'Language, research and quality control',members:['RWS','OneForma','iMerit','TSMG','TELUS Digital','Appen','Welocalize','Productive Playhouse']},
+ {id:'microtasks',title:'Studies, microtasks and project work',members:['Prolific','Terac','Clickworker','Toloka']},
+ {id:'job-boards',title:'Remote job-board feeds',members:['Remotive','Himalayas','Remote OK','Jobicy','Arbeitnow']},
+ {id:'other-remote',title:'Other freelance and remote marketplaces',members:['LinkedIn',...extraSites.map(x=>x[0])]}
+];
+const knownSites = [...sources,...extraSites.map(([name,domain])=>({name,domain})),
+ ...Object.keys(apiConnectors).map(name=>({name,domain:null}))];
+const normalizeId=(s)=>String(s).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+for (const group of searchGroups) {
+ for (const name of group.members) {
+  const s=knownSites.find(x=>x.name===name);
+  if(!s)throw new Error('Missing site configuration: '+name);
+  catalogue.push({id:normalizeId(name),name,groupId:group.id,group:group.title,
+   mode:apiConnectors[name]?'api':'manual',
+   url:s.domain?'https://'+s.domain+'/':(name==='Himalayas'?'https://himalayas.app/':'https://'+(name==='Remote OK'?'remoteok.com':name.toLowerCase()+'.com')+'/'),
+   notes:name==='Prolific'?'Ordinary participant eligibility for Türkiye is not confirmed / may be unavailable.':''});
  }
- return send(res,{error:'Not found'},404);
- }catch(e){return send(res,{error:String(e.message).slice(0,200)},500)}
-}).listen(PORT,'0.0.0.0',()=>console.log('Temporary Income Radar on port '+PORT));
+}
+const lastById = new Map();
+const log=[];
+let running=null;
+function pickSources(params){
+ if (params.sourceId){const x=catalogue.find(x=>x.id===params.sourceId);return x?[x]:null;}
+ if (params.groupId){const g=searchGroups.find(x=>x.id===params.groupId);return g?catalogue.filter(x=>x.groupId===g.id):null;}
+ if (params.allConnected===true)return catalogue.filter(x=>x.mode==='api');
+ return null;
+}
+function cleanJobList(raw){const byUrl=new Map();for(const r of raw){const j=assess(r);if(!j)continue;const key=j.url.toLowerCase();if(!byUrl.has(key)||byUrl.get(key).score<j.score)byUrl.set(key,j);}return [...byUrl.values()].sort((a,b)=>b.score-a.score);}
+function summarise(){
+ const jobs=cleanJobList([...lastById.values()].flatMap(x=>x.items||[]));
+ const checks=catalogue.map(x=>{
+  const scan=lastById.get(x.id);
+  return {id:x.id,name:x.name,groupId:x.groupId,mode:x.mode,url:x.url,
+   status:scan?.status||(x.mode==='api'?'not-scanned':'not-integrated'),
+   found:scan?.found||0,matched:scan?.matched||0,checkedAt:scan?.checkedAt||null,
+   reason:scan?.reason||(x.mode==='manual'?'No supported automatic connector. Review this source directly.':'Not yet checked'),
+   errors:scan?.errors||[],cached:scan?.cached||false,elapsedMs:scan?.elapsedMs||0};
+ });
+ return {lastUpdated:new Date().toISOString(),summary:{totalSources:catalogue.length,
+  connectedSources:catalogue.filter(x=>x.mode==='api').length,
+  checked:checks.filter(x=>x.checkedAt&&x.mode==='api').length,
+  failures:checks.filter(x=>x.status==='error').length,
+  notIntegrated:checks.filter(x=>x.mode==='manual').length,
+  matches:jobs.length},jobs,sources:checks,history:log.slice(-100),progress:running&&{startedAt:running.startedAt,total:running.total,done:running.done,current:running.current}};
+}
+async function checkOne(src, force=false){
+ const old=lastById.get(src.id);
+ if(src.mode==='manual'){
+  const data={name:src.name,status:'not-integrated',found:0,items:[],checkedAt:new Date().toISOString(),reason:'No authorized automatic connector yet; open the source directly to inspect vacancies.',elapsedMs:0};
+  lastById.set(src.id,data);log.push({source:src.name,sourceId:src.id,status:data.status,at:data.checkedAt});
+  return {id:src.id,source:src.name,status:data.status,found:0,matched:0};
+ }
+ if(!force && old && old.checkedAt && Date.now()-Date.parse(old.checkedAt)<HOURS && ['ok','partial'].includes(old.status)){
+  return {id:src.id,source:src.name,status:'cached',found:old.found,matched:old.matched,checkedAt:old.checkedAt};
+ }
+ const data=await api(src.name,apiConnectors[src.name]);
+ data.checkedAt=new Date().toISOString();data.matched=cleanJobList(data.items).length;
+ if(data.status==='ok'&&data.found===0)data.reason='Checked successfully; zero source results (not necessarily zero matching roles).';
+ lastById.set(src.id,data);
+ log.push({source:src.name,sourceId:src.id,status:data.status,at:data.checkedAt,found:data.found,matched:data.matched,reason:data.reason||''});
+ if(log.length>500)log.splice(0,log.length-500);
+ return {id:src.id,source:src.name,status:data.status,found:data.found,matched:data.matched,checkedAt:data.checkedAt,reason:data.reason||'',errors:data.errors||[]};
+}
+async function runQueue(list,force=false){
+ running={startedAt:new Date().toISOString(),total:list.length,done:0,current:null};
+ const report=[];
+ try {
+  for(const src of list){running.current=src.name;report.push(await checkOne(src,force));running.done++;}
+  return {runAt:new Date().toISOString(),mode:'sequential',checks:report,snapshot:summarise()};
+ }finally{running=null;}
+}
+function respond(res,obj,status=200){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(obj));}
+function authorized(req){return !!TOKEN && req.headers.authorization===`Bearer ${TOKEN}`;}
+async function readBody(req){let data='';for await(const chunk of req){data+=chunk;if(data.length>4000)throw new Error('Request too large');}try{return JSON.parse(data||'{}');}catch{throw new Error('Invalid JSON');}}
+const html=readFileSync(new URL('./dashboard.html',import.meta.url),'utf8');
+http.createServer(async(req,res)=>{
+ try{
+  const u=new URL(req.url,'http://localhost');
+  if(req.method==='GET'&&(u.pathname==='/'||u.pathname==='/dashboard')){
+   res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'"});res.end(html);return;
+  }
+  if(req.method==='GET'&&u.pathname==='/health')return respond(res,{ok:true,version:'2.0',connected:catalogue.filter(s=>s.mode==='api').length,total:catalogue.length,running:!!running});
+  if(req.method==='GET'&&u.pathname==='/v2/catalog')return respond(res,{groups:searchGroups.map(g=>({...g,memberCount:g.members.length})),sources:catalogue});
+  if(req.method==='GET'&&u.pathname==='/v2/snapshot')return respond(res,summarise());
+  if(req.method==='GET'&&u.pathname==='/v2/progress')return respond(res,{running:!!running,progress:running});
+  if(req.method==='POST'&&u.pathname==='/v2/scan'){
+   if(!authorized(req))return respond(res,{error:'Unauthorized'},401);
+   if(running)return respond(res,{error:'A sequential run is already in progress',progress:running},409);
+   let data;try{data=await readBody(req)}catch(e){return respond(res,{error:e.message},400)}
+   const chosen=pickSources(data);
+   if(!chosen||chosen.length===0)return respond(res,{error:'Select a valid source, group, or allConnected.'},400);
+   // One queue per request: never use Promise.all across providers.
+   return respond(res,await runQueue(chosen,data.force===true));
+  }
+  // v1 reads maintained for old clients, but old bulk-write endpoint intentionally disabled.
+  if(req.method==='GET'&&u.pathname==='/v1/jobs'){const s=summarise();return respond(res,{scannedAt:s.lastUpdated,summary:s.summary,jobs:s.jobs});}
+  if(req.method==='GET'&&u.pathname==='/v1/sources'){const s=summarise();return respond(res,{sources:s.sources,searchConfigured:false});}
+  if(req.method==='POST'&&u.pathname==='/v1/scan')return respond(res,{error:'Use v2/scan with explicit sourceId or groupId; bulk parallel scans were removed.'},410);
+  return respond(res,{error:'Not found'},404);
+ }catch(e){return respond(res,{error:String(e.message).slice(0,250)},500);}
+}).listen(PORT,'0.0.0.0',()=>console.log('Temporary Income Radar v2 listening on '+PORT));
