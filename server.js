@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
+import {discoveryOutcome} from './discovery-status.mjs';
 
 const app = express();
 const startedAt = new Date().toISOString();
@@ -187,12 +188,13 @@ async function executeRun(runId) {
     }
   }
 
-  const status = blockers.length ? (findings.length ? 'partial_completed' : 'blocked') : 'completed';
+  const completion = discoveryOutcome(blockers, findings);
+  const {status} = completion;
   const note = summarizeBlockers(blockers, findings);
   console.log(JSON.stringify({ event: 'manual_scan_finished', runId, status, blockerCount: blockers.length, findingCount: findings.length, note }));
   setProgress(run, {
     status,
-    outcome: blockers.length ? 'partial' : 'complete',
+    ...completion,
     finishedAt: new Date().toISOString(),
     note,
     progress: { total: queryPlan.length, completed: queryPlan.length, current: null },
@@ -210,7 +212,10 @@ async function executeRun(runId) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'hasan-legal-radar-runner', startedAt, searchConfigured: Boolean(process.env.SERPAPI_KEY), searchTimeoutMs: SEARCH_TIMEOUT_MS });
+  res.json({ ok: true, ready: false, service: 'hasan-legal-radar-runner', startedAt,
+    capabilities: {discovery: true, fullScan: false, durableRecovery: false, verification: false, publication: false},
+    reason: 'Discovery prototype only. Full scan, durable recovery and publication adapters are not connected.',
+    searchConfigured: Boolean(process.env.SERPAPI_KEY), searchTimeoutMs: SEARCH_TIMEOUT_MS });
 });
 
 app.post('/runs', (req, res) => {

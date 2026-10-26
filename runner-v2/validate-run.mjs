@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+const id=process.env.RADAR_LEDGER_ID;
+if(!/^[a-zA-Z0-9_-]{1,120}$/.test(id||''))throw Error('Invalid ledger');
+const run=JSON.parse(fs.readFileSync(`runs/${id}.json`));
+const {validateReview}=await import(pathToFileURL(path.resolve('scripts/review-evidence.mjs')));
+const {canComplete}=await import(pathToFileURL(path.resolve('scripts/review-queue.mjs')));
+for(const task of run.tasks)validateReview(task,task.attempts.at(-1));
+if(!canComplete(run.tasks,JSON.parse(fs.readFileSync('runs/review-queue.json'))))throw Error('Review queue incomplete');
